@@ -2,15 +2,18 @@
 # Copyright (c) 2025 Adrián Quiroga Linares Lectura y referencia permitidas; reutilización y plagio prohibidos
 
 set -euo pipefail
+IFS=$'\n\t'
 
 usage() {
   echo "Uso: $0 <directorio> [--dry-run] [--raw]"
   echo "  --dry-run  Muestra qué archivos se modificarían sin escribir cambios"
-  echo "  --raw      Inserta el texto sin comentar (fuerza texto en crudo)"
+  echo "  --raw      Inserta el texto sin comentar (fuerza texto en crudo en todos los tipos)"
   exit 1
 }
 
-[[ $# -lt 1 ]] && usage
+if [[ $# -lt 1 ]]; then
+  usage
+fi
 
 ROOT="$1"
 shift
@@ -30,90 +33,117 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ ! -d "$ROOT" ]] && {
+if [[ ! -d "$ROOT" ]]; then
   echo "Error: '$ROOT' no es un directorio."
   exit 1
-}
+fi
 
 HEADER_TEXT="Copyright (c) 2025 Adrián Quiroga Linares Lectura y referencia permitidas; reutilización y plagio prohibidos"
 
-# Extensiones permitidas (lookup rápido)
-declare -A ALLOW_EXTS_MAP=(
-  [py]=1 [md]=1 [txt]=1 [java]=1 [c]=1 [h]=1
-  [clp]=1 [sql]=1 [cpp]=1 [sh]=1
-)
+# Extensiones permitidas (solo estas se procesan)
+ALLOW_EXTS=(py md txt java c h clp sql cpp sh)
 
+# Directorios específicos a excluir
 EXCLUDE_DIRS=(
-  .git node_modules vendor dist build target out .venv venv __pycache__
-  .idea .vscode coverage .next .nuxt .cache .gradle .pytest_cache .tox
-  .mypy_cache .terraform .pio
+  .git node_modules vendor dist build target out .venv venv __pycache__ .idea .vscode
+  coverage .next .nuxt .cache .gradle .pytest_cache .tox .mypy_cache .terraform .pio
 )
 
+# Rutas absolutas específicas a excluir
 EXCLUDE_PATHS=(
   "$HOME/Escritorio/IA/CLIPS"
 )
 
-# Cache de rutas excluidas normalizadas
-declare -A EXCLUDED_PATHS_CACHE
-for path in "${EXCLUDE_PATHS[@]}"; do
-  real_path=$(realpath "$path" 2>/dev/null || echo "$path")
-  EXCLUDED_PATHS_CACHE["$real_path"]=1
-done
-
-# Verificaciones optimizadas
+# Detección de archivo de texto (no binario)
 is_text_file() {
-  file -b --mime-encoding "$1" 2>/dev/null | grep -qE "^(us-ascii|utf-8|iso-8859)"
+  local f="$1"
+  LC_ALL=C grep -Iq . "$f" 2>/dev/null
 }
 
+# Comprobar si el archivo ya contiene el HEADER_TEXT en las primeras líneas
 has_header_already() {
-  head -n 3 "$1" 2>/dev/null | grep -Fq "$HEADER_TEXT"
+  local f="$1"
+  head -n 15 "$f" 2>/dev/null | grep -Fq "$HEADER_TEXT"
 }
 
+# Comprobar si el archivo está en una ruta excluida
 is_in_excluded_path() {
-  local abs_file=$(realpath "$1" 2>/dev/null || echo "$1")
-  for excluded in "${!EXCLUDED_PATHS_CACHE[@]}"; do
-    [[ "$abs_file" == "$excluded"* ]] && return 0
+  local f="$1"
+  local abs_file
+  abs_file="$(realpath "$f" 2>/dev/null || echo "$f")"
+
+  for excluded_path in "${EXCLUDE_PATHS[@]}"; do
+    local abs_excluded
+    abs_excluded="$(realpath "$excluded_path" 2>/dev/null || echo "$excluded_path")"
+
+    # Verificar si el archivo está dentro del directorio excluido
+    if [[ "$abs_file" == "$abs_excluded"* ]]; then
+      return 0
+    fi
   done
   return 1
 }
 
+# ¿Debemos procesar esta extensión?
 is_allowed_ext() {
-  local ext="${1##*.}"
-  ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
-  [[ "$ext" == "$1" ]] && return 1
-  [[ ${ALLOW_EXTS_MAP[$ext]+_} ]]
+  local f="$1"
+  local ext="${f##*.}"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+  # Sin extensión => no permitido
+  [[ "$ext" == "$f" ]] && return 1
+  for a in "${ALLOW_EXTS[@]}"; do
+    if [[ "$ext" == "$a" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
+# Estilo de comentario según extensión
+# Devuelve globales: STYLE ("line"|"block"|"raw"), PREFIX, SUFFIX
 get_comment_style() {
-  local ext="${1##*.}"
-  ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+  local f="$1"
+  local ext="${f##*.}"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+
+  STYLE="line"
+  PREFIX="# "
+  SUFFIX=""
 
   case "$ext" in
   py | sh)
+    STYLE="line"
     PREFIX="# "
     SUFFIX=""
     ;;
   java | c | cpp | h)
+    STYLE="line"
     PREFIX="// "
     SUFFIX=""
     ;;
   sql)
+    STYLE="line"
     PREFIX="-- "
     SUFFIX=""
     ;;
   clp)
+    STYLE="line"
     PREFIX="; "
     SUFFIX=""
     ;;
   md)
+    STYLE="block"
     PREFIX="<!-- "
     SUFFIX=" -->"
     ;;
   txt)
+    STYLE="raw"
     PREFIX=""
     SUFFIX=""
     ;;
   *)
+    # Por si acaso, usar comentario de línea por defecto
+    STYLE="line"
     PREFIX="# "
     SUFFIX=""
     ;;
@@ -123,24 +153,49 @@ get_comment_style() {
 process_file() {
   local f="$1"
 
-  # Verificaciones rápidas primero
-  is_in_excluded_path "$f" && return
+  # Verificar si está en una ruta excluida
+  if is_in_excluded_path "$f"; then
+    if $DRY_RUN; then
+      echo "[dry-run] Saltando (ruta excluida): $f"
+    fi
+    return
+  fi
 
-  local base=$(basename "$f")
-  local base_lc=$(echo "$base" | tr '[:upper:]' '[:lower:]')
-  [[ "$base_lc" == "readme.md" ]] && return
+  local base
+  base="$(basename "$f")"
 
-  is_allowed_ext "$f" || return
-  is_text_file "$f" || return
-  has_header_already "$f" && return
+  # Ignorar README.md (insensible a mayúsculas/minúsculas)
+  local base_lc
+  base_lc="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$base_lc" == "readme.md" ]]; then
+    return
+  fi
 
-  # Construir header
+  # Solo trabajar con extensiones permitidas
+  if ! is_allowed_ext "$f"; then
+    return
+  fi
+
+  # Solo archivos de texto
+  if ! is_text_file "$f"; then
+    return
+  fi
+
+  # Evitar duplicar cabecera
+  if has_header_already "$f"; then
+    return
+  fi
+
   local header_block
   if $RAW; then
     header_block="${HEADER_TEXT}\n\n"
   else
     get_comment_style "$f"
-    [[ -n "$SUFFIX" ]] && header_block="${PREFIX}${HEADER_TEXT}${SUFFIX}\n\n" || header_block="${PREFIX}${HEADER_TEXT}\n\n"
+    case "$STYLE" in
+    block) header_block="${PREFIX}${HEADER_TEXT}${SUFFIX}\n\n" ;;
+    line) header_block="${PREFIX}${HEADER_TEXT}\n\n" ;;
+    raw) header_block="${HEADER_TEXT}\n\n" ;;
+    esac
   fi
 
   if $DRY_RUN; then
@@ -148,14 +203,14 @@ process_file() {
     return
   fi
 
-  # Crear archivo temporal
-  local tmp=$(mktemp)
-  trap "rm -f $tmp" RETURN
+  local tmp
+  tmp="$(mktemp)"
 
-  local first_line=$(head -n 1 "$f" 2>/dev/null || true)
+  local first_line
+  first_line="$(head -n 1 "$f" 2>/dev/null || true)"
 
   if [[ "$first_line" =~ ^#! ]]; then
-    echo "$first_line" >"$tmp"
+    printf '%s\n' "$first_line" >"$tmp"
     printf '%b' "$header_block" >>"$tmp"
     tail -n +2 "$f" >>"$tmp"
   else
@@ -163,42 +218,36 @@ process_file() {
     cat "$f" >>"$tmp"
   fi
 
-  # Preservar permisos (optimizado)
-  chmod --reference="$f" "$tmp" 2>/dev/null || chmod $(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null) "$tmp" 2>/dev/null
+  # Preservar permisos
+  local mode=""
+  if mode="$(stat -c '%a' "$f" 2>/dev/null)"; then
+    chmod "$mode" "$tmp" 2>/dev/null || true
+  elif mode="$(stat -f '%Lp' "$f" 2>/dev/null)"; then
+    chmod "$mode" "$tmp" 2>/dev/null || true
+  fi
 
   mv "$tmp" "$f"
-  echo "✓ $f"
+  echo "Añadida cabecera a: $f"
 }
 
-# Construir expresión de exclusión optimizada
+# Construir cláusulas -path para find
 PRUNE_EXPR=()
 for d in "${EXCLUDE_DIRS[@]}"; do
-  [[ ${#PRUNE_EXPR[@]} -gt 0 ]] && PRUNE_EXPR+=(-o)
-  PRUNE_EXPR+=(-path "*/${d}")
+  if [[ -n "${PRUNE_EXPR[*]:-}" ]]; then
+    PRUNE_EXPR+=(-o)
+  fi
+  PRUNE_EXPR+=(-path "*/${d}" -o -path "*/${d}/*")
 done
 
-# Procesar archivos (optimizado con contador)
-echo "Procesando archivos en: $ROOT"
-processed=0
-added=0
-
+# Ejecutar find excluyendo directorios específicos
 if [[ ${#PRUNE_EXPR[@]} -gt 0 ]]; then
   while IFS= read -r -d '' file; do
-    ((processed++))
-    if process_file "$file"; then
-      ((added++))
-    fi
-  done < <(find "$ROOT" -type f \( "${PRUNE_EXPR[@]}" \) -prune -o -type f -print0)
+    process_file "$file"
+  done < <(find "$ROOT" -type f \! \( "${PRUNE_EXPR[@]}" \) -print0)
 else
   while IFS= read -r -d '' file; do
-    ((processed++))
-    if process_file "$file"; then
-      ((added++))
-    fi
+    process_file "$file"
   done < <(find "$ROOT" -type f -print0)
 fi
 
-echo ""
 echo "Proceso completado."
-echo "  Archivos procesados: $processed"
-echo "  Licencias añadidas: $added"
